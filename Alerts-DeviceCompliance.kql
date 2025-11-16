@@ -1,0 +1,23 @@
+// ---------- Low Disk Cleanup ----------
+DeviceInventory_CL
+| where TimeGenerated > ago(30m)
+| summarize arg_max(TimeGenerated, *) by DeviceName_s, DriveLetter_s
+| where NeedsDiskCleanup_b == true
+
+// ---------- N-1 Patch Compliance ----------
+DeviceInventory_CL
+| where TimeGenerated > ago(1d)
+| summarize arg_max(TimeGenerated, *) by DeviceName_s
+| where NeedsPatchRemediation_b == true
+
+
+
+===============================
+DeviceInventory_CL
+| where NeedsDiskCleanup_b == true
+
+=========================
+
+DeviceInventory_CL
+| where NeedsPatchRemediation_b == true
+
