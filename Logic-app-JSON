@@ -1,0 +1,139 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "lowDiskWebhookUrl": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Azure Automation webhook URL for the Low Disk Cleanup runbook"
+      }
+    },
+    "patchWebhookUrl": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Azure Automation webhook URL for the N-1 Patch Remediation runbook"
+      }
+    }
+  },
+  "triggers": {
+    "When_Azure_Monitor_Alert_Fires": {
+      "type": "Request",
+      "kind": "Http",
+      "inputs": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "alertContext": {
+                  "type": "object",
+                  "properties": {
+                    "searchResults": {
+                      "type": "object",
+                      "properties": {
+                        "tables": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "rows": {
+                                "type": "array",
+                                "items": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": [
+                                      "string",
+                                      "boolean",
+                                      "number",
+                                      "null"
+                                    ]
+                                  }
+                                }
+                              }
+                            },
+                            "required": [
+                              "rows"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "tables"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "searchResults"
+                  ]
+                }
+              },
+              "required": [
+                "alertContext"
+              ]
+            }
+          },
+          "required": [
+            "data"
+          ]
+        }
+      }
+    }
+  },
+  "actions": {
+    "For_each_result_row": {
+      "type": "Foreach",
+      "foreach": "@body('When_Azure_Monitor_Alert_Fires')?['data']?['alertContext']?['searchResults']?['tables'][0]?['rows']",
+      "actions": {
+        "If_NeedsDiskCleanup": {
+          "type": "If",
+          "expression": "@equals(items('For_each_result_row')[2], true)",
+          "actions": {
+            "Call_LowDiskCleanup_Runbook": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "@parameters('lowDiskWebhookUrl')",
+                "headers": {
+                  "Content-Type": "application/json"
+                },
+                "body": {
+                  "ComputerName": "@{items('For_each_result_row')[0]}",
+                  "IssueType": "DiskCleanup"
+                }
+              },
+              "runAfter": {}
+            }
+          },
+          "else": {}
+        },
+        "If_NeedsPatchRemediation": {
+          "type": "If",
+          "expression": "@equals(items('For_each_result_row')[3], true)",
+          "actions": {
+            "Call_PatchN1_Runbook": {
+              "type": "Http",
+              "inputs": {
+                "method": "POST",
+                "uri": "@parameters('patchWebhookUrl')",
+                "headers": {
+                  "Content-Type": "application/json"
+                },
+                "body": {
+                  "ComputerName": "@{items('For_each_result_row')[0]}",
+                  "IssueType": 'PatchNMinus1'
+                }
+              },
+              "runAfter": {}
+            }
+          },
+          "else": {}
+        }
+      },
+      "runAfter": {}
+    }
+  },
+  "outputs": {}
+}
