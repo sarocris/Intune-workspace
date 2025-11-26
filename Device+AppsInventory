@@ -1,0 +1,555 @@
+#Author-Saravana
+# Enable TLS 1.2 support 
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# ===================== WORKSPACE CONFIG =====================
+# Replace with your Log Analytics Workspace ID
+$CustomerId = "<YOUR_WORKSPACE_ID>"  
+
+# Replace with your Primary Key
+$SharedKey  = "<YOUR_PRIMARY_KEY>"
+
+# Control if you want to collect App or Device Inventory or both (True = Collect)
+$CollectAppInventory    = $true
+$CollectDeviceInventory = $true
+
+# Log types (tables will be AppInventory_CL and DeviceInventory_CL)
+$AppLogName    = "AppInventory"
+$DeviceLogName = "DeviceInventory"
+
+# Batch size for App inventory – tune if needed
+$AppBatchSize = 10
+
+$Date = (Get-Date)
+$TimeStampField = "TimeGenerated"
+
+# Simple sanity-check so we don't hit the API with placeholders
+if ($CustomerId -like "<*>" -or $SharedKey -like "<*>") {
+    Write-Error "Please set CustomerId (Workspace ID) and SharedKey (Primary key) at top of script."
+    exit 1
+}
+#endregion initialize
+
+
+#region helper functions
+function Get-AzureADTenantID {
+    $AzureADTenantInfoRegistryKeyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\TenantInfo"
+    $AzureADTenantID = Get-ChildItem -Path $AzureADTenantInfoRegistryKeyPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty "PSChildName"
+    return $AzureADTenantID
+}
+
+function Get-AzureADDeviceID {
+    Process {
+        $AzureADJoinInfoRegistryKeyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo"
+        $AzureADJoinInfoThumbprint = Get-ChildItem -Path $AzureADJoinInfoRegistryKeyPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty "PSChildName"
+        if ($AzureADJoinInfoThumbprint) {
+            $AzureADJoinCertificate = Get-ChildItem -Path "Cert:\LocalMachine\My" -Recurse | Where-Object { $_.Thumbprint -eq $AzureADJoinInfoThumbprint }
+            if ($AzureADJoinCertificate) {
+                $AzureADDeviceID = ($AzureADJoinCertificate | Select-Object -ExpandProperty "Subject") -replace "CN=", ""
+                return $AzureADDeviceID
+            }
+        }
+    }
+}
+
+function Get-AzureADJoinDate {
+    Process {
+        $AzureADJoinInfoRegistryKeyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\CloudDomainJoin\JoinInfo"
+        $AzureADJoinInfoThumbprint = Get-ChildItem -Path $AzureADJoinInfoRegistryKeyPath -ErrorAction SilentlyContinue | Select-Object -ExpandProperty "PSChildName"
+        if ($AzureADJoinInfoThumbprint) {
+            $AzureADJoinCertificate = Get-ChildItem -Path "Cert:\LocalMachine\My" -Recurse | Where-Object { $_.Thumbprint -eq $AzureADJoinInfoThumbprint }
+            if ($AzureADJoinCertificate) {
+                $AzureADJoinDate = ($AzureADJoinCertificate | Select-Object -ExpandProperty "NotBefore") 
+                return $AzureADJoinDate
+            }
+        }
+    }
+}
+
+function Get-InstalledApplications {
+    param(
+        [string]$UserSid
+    )
+    
+    New-PSDrive -PSProvider Registry -Name "HKU" -Root HKEY_USERS -ErrorAction SilentlyContinue | Out-Null
+    $regpath = @("HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*")
+    if ($UserSid) {
+        $regpath += "HKU:\$UserSid\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    }
+    if (-not ([IntPtr]::Size -eq 4)) {
+        $regpath += "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        if ($UserSid) {
+            $regpath += "HKU:\$UserSid\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        }
+    }
+
+    $propertyNames = 'DisplayName', 'DisplayVersion', 'Publisher', 'UninstallString', 'InstallLocation', 'InstallDate', 'InstallSource'
+    $Apps = Get-ItemProperty $regpath -Name $propertyNames -ErrorAction SilentlyContinue |
+        ForEach-Object { if ($_.DisplayName) { $_ } } |
+        Select-Object DisplayName, DisplayVersion, Publisher, UninstallString, PSPath, InstallLocation, InstallDate, InstallSource |
+        Sort-Object DisplayName   
+
+    Remove-PSDrive -Name "HKU" -ErrorAction SilentlyContinue | Out-Null
+    return $Apps
+}
+
+Function Send-LogAnalyticsData {
+    param(
+        [string]$sharedKey,
+        [byte[]]$body, 
+        [string]$logType,
+        [string]$customerId
+    )
+
+    $method        = "POST"
+    $contentType   = "application/json"
+    $resource      = "/api/logs"
+    $date          = [DateTime]::UtcNow.ToString("r")
+    $contentLength = $body.Length
+
+    # Construct authorization signature
+    $xHeaders     = "x-ms-date:" + $date
+    $stringToHash = $method + "`n" + $contentLength + "`n" + $contentType + "`n" + $xHeaders + "`n" + $resource
+    $bytesToHash  = [Text.Encoding]::UTF8.GetBytes($stringToHash)
+    $keyBytes     = [Convert]::FromBase64String($sharedKey)
+
+    $sha256           = New-Object System.Security.Cryptography.HMACSHA256
+    $sha256.Key       = $keyBytes
+    $calculatedHash   = $sha256.ComputeHash($bytesToHash)
+    $encodedHash      = [Convert]::ToBase64String($calculatedHash)
+    $signature        = 'SharedKey {0}:{1}' -f $customerId, $encodedHash
+
+    # IMPORTANT – correct ingestion URI
+    $uri = "https://$customerId.ods.opinsights.azure.com/api/logs?api-version=2016-04-01"
+    Write-Host "Using URI: $uri"
+
+    # Validate payload size (limit 32 MB)
+    if ($body.Length -gt (31.9 * 1024 * 1024)) {
+        throw("Upload payload is too big and exceeds the 32Mb limit. Current payload size is: " + ($body.Length/1024/1024).ToString("#.#") + "Mb")
+    }
+    $payloadsize = ("Upload payload size is " + ($body.Length/1024).ToString("#.#") + "Kb ")
+
+    $headers = @{
+        "Authorization"        = $signature;
+        "Log-Type"             = $logType;
+        "x-ms-date"            = $date;
+        "time-generated-field" = $TimeStampField;
+    }
+
+    $statusmessage = $null
+    try {
+        $response      = Invoke-WebRequest -Uri $uri -Method $method -ContentType $contentType -Headers $headers -Body $body -UseBasicParsing -ErrorAction Stop
+        $statusmessage = "$($response.StatusCode) : $payloadsize"
+    }
+    catch {
+        if ($_.Exception.Response) {
+            $stream   = $_.Exception.Response.GetResponseStream()
+            $reader   = New-Object System.IO.StreamReader($stream)
+            $respBody = $reader.ReadToEnd()
+            $statusmessage = "ERROR : $payloadsize : $respBody"
+        }
+        else {
+            $statusmessage = "ERROR : $payloadsize : $($_.Exception.Message)"
+        }
+    }
+
+    Write-Host "Send-LogAnalyticsData ($logType) => $statusmessage"
+    return $statusmessage 
+}
+
+function Send-BatchToLogAnalytics {
+    param(
+        [array]$Records,
+        [string]$LogType,
+        [string]$CustomerId,
+        [string]$SharedKey,
+        [int]$BatchIndex = 1
+    )
+
+    if (-not $Records -or $Records.Count -eq 0) {
+        return $null
+    }
+
+    $json  = $Records | ConvertTo-Json -Depth 5
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    Write-Host "$LogType Batch $BatchIndex : $($Records.Count) records, $($bytes.Length) bytes"
+
+    $resp  = Send-LogAnalyticsData -customerId $CustomerId -sharedKey $SharedKey -body $bytes -logType $LogType
+    return $resp
+}
+#endregion helper functions
+
+
+#region COMMON DEVICE INFO
+if (@(Get-ChildItem HKLM:SOFTWARE\Microsoft\Enrollments\ -Recurse | Where-Object { $_.PSChildName -eq 'MS DM Server' })) {
+    $MSDMServerInfo   = Get-ChildItem HKLM:SOFTWARE\Microsoft\Enrollments\ -Recurse | Where-Object { $_.PSChildName -eq 'MS DM Server' }
+    $ManagedDeviceInfo = Get-ItemProperty -LiteralPath "Registry::$($MSDMServerInfo)" -ErrorAction SilentlyContinue
+}
+
+$ManagedDeviceName = $ManagedDeviceInfo.EntDeviceName
+$ManagedDeviceID   = $ManagedDeviceInfo.EntDMID
+$AzureADDeviceID   = Get-AzureADDeviceID
+$AzureADTenantID   = Get-AzureADTenantID
+
+$ComputerInfo         = Get-CimInstance -ClassName Win32_ComputerSystem
+$ComputerName         = $ComputerInfo.Name
+$ComputerManufacturer = $ComputerInfo.Manufacturer
+
+if ($ComputerManufacturer -match "HP|Hewlett-Packard") {
+    $ComputerManufacturer = "HP"
+}
+#endregion COMMON DEVICE INFO
+
+
+#region DEVICE INVENTORY
+$DevicePayLoad = $null
+if ($CollectDeviceInventory) {
+
+    try {
+        $DefaultAUService = (New-Object -ComObject "Microsoft.Update.ServiceManager").Services |
+            Where-Object { $_.isDefaultAUService -eq $True } | Select-Object -First 1 -Property Name
+    } catch { $DefaultAUService = $null }
+
+    $AUMeteredNetwork = (Get-ItemProperty -Path HKLM:\Software\Microsoft\WindowsUpdate\UX\Settings\ -ErrorAction SilentlyContinue).AllowAutoWindowsUpdateDownloadOverMeteredNetwork 
+    if ($AUMeteredNetwork -eq "0") { $AUMetered = "false" } else { $AUMetered = "true" }
+
+    $ComputerOSInfo   = Get-CimInstance -ClassName Win32_OperatingSystem
+    $ComputerBiosInfo = Get-CimInstance -ClassName Win32_Bios
+    $ComputerModel    = $ComputerInfo.Model
+    $ComputerLastBoot = $ComputerOSInfo.LastBootUpTime
+    $ComputerUptime   = [int](New-TimeSpan -Start $ComputerLastBoot -End $Date).Days
+    $ComputerInstallDate = $ComputerOSInfo.InstallDate
+
+    $DisplayVersion = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name DisplayVersion -ErrorAction SilentlyContinue).DisplayVersion
+    if ([string]::IsNullOrEmpty($DisplayVersion)) {
+        $ComputerWindowsVersion = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name ReleaseId -ErrorAction SilentlyContinue).ReleaseId
+    } else {
+        $ComputerWindowsVersion = $DisplayVersion
+    }
+
+    $ComputerOSName          = $ComputerOSInfo.Caption
+    $ComputerSystemSkuNumber = $ComputerInfo.SystemSKUNumber
+    $ComputerSerialNr        = $ComputerBiosInfo.SerialNumber
+    $ComputerBiosUUID        = Get-CimInstance Win32_ComputerSystemProduct | Select-Object -ExpandProperty UUID
+    $ComputerBiosVersion     = $ComputerBiosInfo.SMBIOSBIOSVersion
+    $ComputerBiosDate        = $ComputerBiosInfo.ReleaseDate
+    $ComputerFirmwareType    = $env:firmware_type
+    $PCSystemType            = $ComputerInfo.PCSystemType
+    switch ($PCSystemType) {
+        0 {$ComputerPCSystemType = "Unspecified"}
+        1 {$ComputerPCSystemType = "Desktop"}
+        2 {$ComputerPCSystemType = "Laptop"}
+        3 {$ComputerPCSystemType = "Workstation"}
+        4 {$ComputerPCSystemType = "EnterpriseServer"}
+        5 {$ComputerPCSystemType = "SOHOServer"}
+        6 {$ComputerPCSystemType = "AppliancePC"}
+        7 {$ComputerPCSystemType = "PerformanceServer"}
+        8 {$ComputerPCSystemType = "Maximum"}
+        default {$ComputerPCSystemType = "Unspecified"}
+    }
+
+    $PCSystemTypeEx = $ComputerInfo.PCSystemTypeEx
+    switch ($PCSystemTypeEx) {
+        0 {$ComputerPCSystemTypeEx = "Unspecified"}
+        1 {$ComputerPCSystemTypeEx = "Desktop"}
+        2 {$ComputerPCSystemTypeEx = "Laptop"}
+        3 {$ComputerPCSystemTypeEx = "Workstation"}
+        4 {$ComputerPCSystemTypeEx = "EnterpriseServer"}
+        5 {$ComputerPCSystemTypeEx = "SOHOServer"}
+        6 {$ComputerPCSystemTypeEx = "AppliancePC"}
+        7 {$ComputerPCSystemTypeEx = "PerformanceServer"}
+        8 {$ComputerPCSystemTypeEx = "Slate"}
+        9 {$ComputerPCSystemTypeEx = "Maximum"}
+        default {$ComputerPCSystemTypeEx = "Unspecified"}
+    }
+
+    $ComputerPhysicalMemory = [Math]::Round(($ComputerInfo.TotalPhysicalMemory / 1GB))
+    $ComputerOSBuild        = $ComputerOSInfo.BuildNumber
+    $ComputerOSRevision     = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name UBR -ErrorAction SilentlyContinue).UBR
+    $ComputerCPU            = Get-CimInstance win32_processor | Select-Object Name, Manufacturer, NumberOfCores, NumberOfLogicalProcessors
+    $ComputerProcessorManufacturer      = $ComputerCPU.Manufacturer | Get-Unique
+    $ComputerProcessorName              = $ComputerCPU.Name | Get-Unique
+    $ComputerNumberOfCores              = $ComputerCPU.NumberOfCores | Get-Unique
+    $ComputerNumberOfLogicalProcessors  = $ComputerCPU.NumberOfLogicalProcessors | Get-Unique
+    $ComputerSystemSKU                  = (Get-CIMInstance -ClassName MS_SystemInformation -NameSpace root\WMI -ErrorAction SilentlyContinue).SystemSku.Trim()
+
+    try {
+        $TPMValues = Get-Tpm -ErrorAction SilentlyContinue | Select-Object -Property TPMReady, TPMPresent, TPMEnabled, TPMActivated, ManagedAuthLevel
+    } catch { $TPMValues = $null }
+
+    try {
+        $ComputerTPMThumbprint = (Get-TpmEndorsementKeyInfo -ErrorAction SilentlyContinue).AdditionalCertificates.Thumbprint
+    } catch { $ComputerTPMThumbprint = $null }
+
+    try {
+        $BitLockerInfo = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue | Select-Object -Property *
+    } catch { $BitLockerInfo = $null }
+
+    $ComputerTPMReady    = $TPMValues.TPMReady
+    $ComputerTPMPresent  = $TPMValues.TPMPresent
+    $ComputerTPMEnabled  = $TPMValues.TPMEnabled
+    $ComputerTPMActivated= $TPMValues.TPMActivated
+
+    $ComputerBitlockerCipher          = $BitLockerInfo.EncryptionMethod
+    $ComputerBitlockerStatus          = $BitLockerInfo.VolumeStatus
+    $ComputerBitlockerProtection      = $BitLockerInfo.ProtectionStatus
+    $ComputerDefaultAUService         = $DefaultAUService.Name
+    $ComputerAUMetered                = $AUMetered
+
+    switch -Wildcard ($ComputerManufacturer) {
+        "*Microsoft*" {
+            $ComputerManufacturer = "Microsoft"
+            $ComputerModel        = (Get-WmiObject -Class Win32_ComputerSystem | Select-Object -ExpandProperty Model).Trim()
+            $ComputerSystemSKU    = Get-WmiObject -Namespace root\wmi -Class MS_SystemInformation | Select-Object -ExpandProperty SystemSKU
+        }
+        "*HP*" {
+            $ComputerModel        = (Get-WmiObject -Class Win32_ComputerSystem | Select-Object -ExpandProperty Model).Trim()
+            $ComputerSystemSKU    = (Get-CIMInstance -ClassName MS_SystemInformation -NameSpace root\WMI).BaseBoardProduct.Trim()
+            $CurrentBIOSProperties = (Get-WmiObject -Class Win32_BIOS | Select-Object -Property *)
+            switch -wildcard ($($CurrentBIOSProperties.SMBIOSBIOSVersion)) {
+                "*ver*" {
+                    if ($CurrentBIOSProperties.SMBIOSBIOSVersion -match '.F.\d+$') {
+                        $ComputerBiosVersion = ($CurrentBIOSProperties.SMBIOSBIOSVersion -split "Ver.")[1].Trim()
+                    } else {
+                        $ComputerBiosVersion = [System.Version]::Parse(($CurrentBIOSProperties.SMBIOSBIOSVersion).TrimStart($CurrentBIOSProperties.SMBIOSBIOSVersion.Split(".")[0]).TrimStart(".").Trim().Split(" ")[0])
+                    }
+                }
+                default {
+                    $ComputerBiosVersion = "$($CurrentBIOSProperties.SystemBiosMajorVersion).$($CurrentBIOSProperties.SystemBiosMinorVersion)"
+                }
+            }
+        }
+        "*Dell*" {
+            $ComputerManufacturer = "Dell"
+            $ComputerModel        = (Get-WmiObject -Class Win32_ComputerSystem | Select-Object -ExpandProperty Model).Trim()
+            $ComputerSystemSKU    = (Get-CIMInstance -ClassName MS_SystemInformation -NameSpace root\WMI).SystemSku.Trim()
+            $ComputerBiosVersion  = (Get-WmiObject -Class Win32_BIOS | Select-Object -ExpandProperty SMBIOSBIOSVersion).Trim()
+        }
+        "*Lenovo*" {
+            $ComputerManufacturer = "Lenovo"
+            $ComputerModel        = (Get-WmiObject -Class Win32_ComputerSystemProduct | Select-Object -ExpandProperty Version).Trim()
+            $ComputerSystemSKU    = ((Get-WmiObject -Class Win32_ComputerSystem | Select-Object -ExpandProperty Model).SubString(0, 4)).Trim()
+            $CurrentBIOSProperties = (Get-WmiObject -Class Win32_BIOS | Select-Object -Property *)
+            $ComputerBiosVersion  = "$($CurrentBIOSProperties.SystemBiosMajorVersion).$($CurrentBIOSProperties.SystemBiosMinorVersion)"
+        }
+    }
+
+    $NetWorkArray = @()
+    $CurrentNetAdapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+    foreach ($CurrentNetAdapter in $CurrentNetAdapters) {
+        try {
+            $IPConfiguration = Get-NetIPConfiguration -InterfaceIndex $CurrentNetAdapter[0].ifIndex -ErrorAction Stop
+        }
+        catch { $IPConfiguration = $null }
+
+        $ComputerNetInterfaceDescription = $CurrentNetAdapter.InterfaceDescription
+        $ComputerNetProfileName          = $IPConfiguration.NetProfile.Name
+        $ComputerNetIPv4Adress           = $IPConfiguration.IPv4Address.IPAddress
+        $ComputerNetInterfaceAlias       = $CurrentNetAdapter.InterfaceAlias
+        $ComputerNetIPv4DefaultGateway   = $IPConfiguration.IPv4DefaultGateway.NextHop
+        $ComputerNetMacAddress           = $CurrentNetAdapter.MacAddress
+
+        $tempnetwork = [PSCustomObject]@{
+            NetInterfaceDescription = "$ComputerNetInterfaceDescription"
+            NetProfileName          = "$ComputerNetProfileName"
+            NetIPv4Adress           = "$ComputerNetIPv4Adress"
+            NetInterfaceAlias       = "$ComputerNetInterfaceAlias"
+            NetIPv4DefaultGateway   = "$ComputerNetIPv4DefaultGateway"
+            MacAddress              = "$ComputerNetMacAddress"
+        }
+        $NetWorkArray += $tempnetwork
+    }
+    [System.Collections.ArrayList]$NetWorkArrayList = $NetWorkArray
+
+    $DiskArray = @()
+    try {
+        $Disks = Get-PhysicalDisk -ErrorAction SilentlyContinue | Where-Object { $_.BusType -match "NVMe|SATA|SAS|ATAPI|RAID" }
+    } catch { $Disks = @() }
+
+    foreach ($Disk in ($Disks | Sort-Object DeviceID)) {
+        try {
+            $DiskHealth = Get-PhysicalDisk -UniqueId $($Disk.UniqueId) | Get-StorageReliabilityCounter |
+                Select-Object -Property Wear, ReadErrorsTotal, ReadErrorsUncorrected, WriteErrorsTotal, WriteErrorsUncorrected, Temperature, TemperatureMax
+        } catch { $DiskHealth = $null }
+
+        $DriveDetails   = Get-PhysicalDisk -UniqueId $($Disk.UniqueId) | Select-Object MediaType, HealthStatus
+        $DriveMediaType = $DriveDetails.MediaType
+        $DriveHealthState = $DriveDetails.HealthStatus
+        $DiskTempDelta  = [int]$($DiskHealth.Temperature) - [int]$($DiskHealth.TemperatureMax)
+
+        $DiskHealthState = [PSCustomObject]@{
+            "Disk Number"                         = $Disk.DeviceID
+            FriendlyName                          = $Disk.FriendlyName
+            HealthStatus                          = $DriveHealthState
+            MediaType                             = $DriveMediaType
+            "Disk Wear"                           = [int]($DiskHealth.Wear)
+            "Disk $($Disk.DeviceID) Read Errors"  = [int]($DiskHealth.ReadErrorsTotal)
+            "Disk $($Disk.DeviceID) Temperature Delta" = $DiskTempDelta
+            "Disk $($Disk.DeviceID) ReadErrorsUncorrected" = $DiskHealth.ReadErrorsUncorrected
+            "Disk $($Disk.DeviceID) ReadErrorsTotal"       = $DiskHealth.ReadErrorsTotal
+            "Disk $($Disk.DeviceID) WriteErrorsUncorrected"= $DiskHealth.WriteErrorsUncorrected
+            "Disk $($Disk.DeviceID) WriteErrorsTotal"      = $DiskHealth.WriteErrorsTotal
+        }
+
+        $DiskArray += $DiskHealthState
+    }
+    [System.Collections.ArrayList]$DiskHealthArrayList = $DiskArray
+
+    $Inventory = New-Object System.Object
+    $Inventory | Add-Member NoteProperty "TimeGenerated"             ((Get-Date).ToUniversalTime().ToString("o")) -Force
+    $Inventory | Add-Member NoteProperty "ManagedDeviceName"         "$ManagedDeviceName" -Force
+    $Inventory | Add-Member NoteProperty "AzureADDeviceID"           "$AzureADDeviceID" -Force
+    $Inventory | Add-Member NoteProperty "ManagedDeviceID"           "$ManagedDeviceID" -Force
+    $Inventory | Add-Member NoteProperty "ComputerName"              "$ComputerName" -Force
+    $Inventory | Add-Member NoteProperty "Model"                     "$ComputerModel" -Force
+    $Inventory | Add-Member NoteProperty "Manufacturer"              "$ComputerManufacturer" -Force
+    $Inventory | Add-Member NoteProperty "PCSystemType"              "$ComputerPCSystemType" -Force
+    $Inventory | Add-Member NoteProperty "PCSystemTypeEx"            "$ComputerPCSystemTypeEx" -Force
+    $Inventory | Add-Member NoteProperty "ComputerUpTime"            "$ComputerUptime" -Force
+    $Inventory | Add-Member NoteProperty "LastBoot"                  "$ComputerLastBoot" -Force
+    $Inventory | Add-Member NoteProperty "InstallDate"               "$ComputerInstallDate" -Force
+    $Inventory | Add-Member NoteProperty "WindowsVersion"            "$ComputerWindowsVersion" -Force
+    $Inventory | Add-Member NoteProperty "DefaultAUService"          "$ComputerDefaultAUService" -Force
+    $Inventory | Add-Member NoteProperty "AUMetered"                 "$ComputerAUMetered" -Force
+    $Inventory | Add-Member NoteProperty "SystemSkuNumber"           "$ComputerSystemSkuNumber" -Force
+    $Inventory | Add-Member NoteProperty "SerialNumber"              "$ComputerSerialNr" -Force
+    $Inventory | Add-Member NoteProperty "SMBIOSUUID"                "$ComputerBiosUUID" -Force
+    $Inventory | Add-Member NoteProperty "BiosVersion"               "$ComputerBiosVersion" -Force
+    $Inventory | Add-Member NoteProperty "BiosDate"                  "$ComputerBiosDate" -Force
+    $Inventory | Add-Member NoteProperty "SystemSKU"                 "$ComputerSystemSKU" -Force
+    $Inventory | Add-Member NoteProperty "FirmwareType"              "$ComputerFirmwareType" -Force
+    $Inventory | Add-Member NoteProperty "Memory"                    "$ComputerPhysicalMemory" -Force
+    $Inventory | Add-Member NoteProperty "OSBuild"                   "$ComputerOSBuild" -Force
+    $Inventory | Add-Member NoteProperty "OSRevision"                "$ComputerOSRevision" -Force
+    $Inventory | Add-Member NoteProperty "OSName"                    "$ComputerOSName" -Force
+    $Inventory | Add-Member NoteProperty "CPUManufacturer"           "$ComputerProcessorManufacturer" -Force
+    $Inventory | Add-Member NoteProperty "CPUName"                   "$ComputerProcessorName" -Force
+    $Inventory | Add-Member NoteProperty "CPUCores"                  "$ComputerNumberOfCores" -Force
+    $Inventory | Add-Member NoteProperty "CPULogical"                "$ComputerNumberOfLogicalProcessors" -Force
+    $Inventory | Add-Member NoteProperty "TPMReady"                  "$ComputerTPMReady" -Force
+    $Inventory | Add-Member NoteProperty "TPMPresent"                "$ComputerTPMPresent" -Force
+    $Inventory | Add-Member NoteProperty "TPMEnabled"                "$ComputerTPMEnabled" -Force
+    $Inventory | Add-Member NoteProperty "TPMActived"                "$ComputerTPMActivated" -Force
+    $Inventory | Add-Member NoteProperty "TPMThumbprint"             "$ComputerTPMThumbprint" -Force
+    $Inventory | Add-Member NoteProperty "BitlockerCipher"           "$ComputerBitlockerCipher" -Force
+    $Inventory | Add-Member NoteProperty "BitlockerVolumeStatus"     "$ComputerBitlockerStatus" -Force
+    $Inventory | Add-Member NoteProperty "BitlockerProtectionStatus" "$ComputerBitlockerProtection" -Force
+    $Inventory | Add-Member NoteProperty "NetworkAdapters"           $NetWorkArrayList -Force
+    $Inventory | Add-Member NoteProperty "DiskHealth"                $DiskHealthArrayList -Force
+
+    $DevicePayLoad = @($Inventory)
+}
+#endregion DEVICE INVENTORY
+
+
+#region APP INVENTORY
+$AppPayLoad = $null
+if ($CollectAppInventory) {
+
+    $CurrentLoggedOnUser = (Get-CimInstance win32_computersystem).UserName
+    if (-not ([string]::IsNullOrEmpty($CurrentLoggedOnUser))) {
+        $AdObj  = New-Object System.Security.Principal.NTAccount($CurrentLoggedOnUser)
+        $strSID = $AdObj.Translate([System.Security.Principal.SecurityIdentifier])
+        $UserSid = $strSID.Value
+    } else {
+        $UserSid = $null
+    }
+    
+    $MyApps         = Get-InstalledApplications -UserSid $UserSid
+    $UniqueApps     = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -eq 1 }).Group
+    $DuplicatedApps = ($MyApps | Group-Object Displayname | Where-Object { $_.Count -gt 1 }).Group
+
+    $NewestDuplicateApp = ($DuplicatedApps | Group-Object DisplayName) |
+        ForEach-Object {
+            $_.Group | Sort-Object {[version]$_.DisplayVersion} -Descending | Select-Object -First 1
+        }
+
+    $CleanAppList = $UniqueApps + $NewestDuplicateApp | Sort-Object DisplayName
+
+    $AppArray   = @()
+    $CurrentTime = (Get-Date).ToUniversalTime().ToString("o")
+
+    foreach ($App in $CleanAppList) {
+        $tempapp = New-Object -TypeName PSObject
+        $tempapp | Add-Member NoteProperty "TimeGenerated"      $CurrentTime -Force
+        $tempapp | Add-Member NoteProperty "ComputerName"       "$ComputerName" -Force
+        $tempapp | Add-Member NoteProperty "ManagedDeviceName"  "$ManagedDeviceName" -Force
+        $tempapp | Add-Member NoteProperty "ManagedDeviceID"    "$ManagedDeviceID" -Force
+        $tempapp | Add-Member NoteProperty "WindowsVersion"     "$ComputerWindowsVersion" -Force
+        $tempapp | Add-Member NoteProperty "OSBuild"            "$ComputerOSBuild" -Force
+
+        $tempapp | Add-Member NoteProperty "AppName"            $App.DisplayName -Force
+        $tempapp | Add-Member NoteProperty "AppVersion"         $App.DisplayVersion -Force
+        $tempapp | Add-Member NoteProperty "AppInstallDate"     $App.InstallDate -Force -ErrorAction SilentlyContinue
+        $tempapp | Add-Member NoteProperty "AppPublisher"       $App.Publisher -Force
+        $tempapp | Add-Member NoteProperty "AppUninstallString" $App.UninstallString -Force
+        $tempapp | Add-Member NoteProperty "AppUninstallRegPath"($App.PSPath.Split("::")[-1])
+        $tempapp | Add-Member NoteProperty "AppInstallLocation" $App.InstallLocation
+        $tempapp | Add-Member NoteProperty "AppInstallSource"   $App.InstallSource
+
+        $AppArray += $tempapp
+    }
+
+    $AppPayLoad = $AppArray
+}
+#endregion APP INVENTORY
+
+
+#region SEND TO LOG ANALYTICS
+$DeviceResponseOK = $false
+$AppResponseOK    = $false
+
+$DeviceResponse = $null
+$AppResponses   = @()
+
+if ($CollectDeviceInventory -and $DevicePayLoad) {
+    $DeviceResponse = Send-BatchToLogAnalytics -Records $DevicePayLoad -LogType $DeviceLogName -CustomerId $CustomerId -SharedKey $SharedKey -BatchIndex 1
+    if ($DeviceResponse -match "200 :") { $DeviceResponseOK = $true }
+}
+
+if ($CollectAppInventory -and $AppPayLoad) {
+    $totalApps = $AppPayLoad.Count
+    if ($totalApps -gt 0) {
+        $batchIndex = 1
+        for ($i = 0; $i -lt $totalApps; $i += $AppBatchSize) {
+            $endIndex = $i + $AppBatchSize - 1
+            if ($endIndex -ge $totalApps) { $endIndex = $totalApps - 1 }
+
+            $batch = $AppPayLoad[$i..$endIndex]
+            $resp  = Send-BatchToLogAnalytics -Records $batch -LogType $AppLogName -CustomerId $CustomerId -SharedKey $SharedKey -BatchIndex $batchIndex
+            $AppResponses += $resp
+            $batchIndex++
+        }
+
+        if (($AppResponses | Where-Object { $_ -match "200 :" }).Count -eq $AppResponses.Count) {
+            $AppResponseOK = $true
+        }
+    }
+}
+
+$dateString    = Get-Date -Format "dd-MM HH:mm"
+$OutputMessage = "InventoryDate:$dateString "
+
+if ($CollectDeviceInventory) {
+    if ($DeviceResponseOK) {
+        $OutputMessage += "DeviceInventory:OK "
+    } else {
+        $OutputMessage += "DeviceInventory:Fail "
+    }
+}
+
+if ($CollectAppInventory) {
+    if (-not $AppPayLoad -or $AppPayLoad.Count -eq 0) {
+        $OutputMessage += "AppInventory:NoApps "
+    }
+    elseif ($AppResponseOK) {
+        $OutputMessage += "AppInventory:OK "
+    }
+    else {
+        $OutputMessage += "AppInventory:Fail "
+    }
+}
+
+Write-Output $OutputMessage
+Exit 0
+#endregion SEND
